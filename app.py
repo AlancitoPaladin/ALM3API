@@ -1,12 +1,13 @@
+import os
 from flask import Flask
+from api.factory import create_app
+from database.database_config import init_db, mongo
 
-app = Flask(__name__)
+app = create_app()
 
+app.config["DEBUG"] = True
 
-@app.route('/')
-def hello_world():  # put the application's code here
-    return 'Hello World!'
+init_db(app)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run()
