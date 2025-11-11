@@ -1,12 +1,13 @@
-from flask import Blueprint, request, jsonify
-from bson import ObjectId
-from database.database_config import mongo
-from models.user_models import UserModel
-from werkzeug.security import generate_password_hash, check_password_hash
-from api.utils import send_password
-from pydantic import ValidationError
 import random
 import string
+
+from flask import Blueprint, request, jsonify
+from pydantic import ValidationError
+from werkzeug.security import generate_password_hash, check_password_hash
+
+from api.utils import send_password
+from database.database_config import mongo
+from models.user_models import UserModel
 
 auth_bp = Blueprint("auth_bp", __name__)
 
