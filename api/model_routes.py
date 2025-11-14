@@ -1,13 +1,33 @@
 import os
 from io import BytesIO
 
+import boto3
 import cv2
 import numpy as np
 import trimesh
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
 from flask import Blueprint, request, jsonify, send_file
 from sklearn.cluster import KMeans
 from ultralytics import YOLO
 from werkzeug.utils import secure_filename
+
+load_dotenv()
+
+AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
+S3_MODELS_PREFIX = '3d_models/'
+S3_GENERATED_PREFIX = 'generated_models/'
+
+# Cliente S3
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION
+)
 
 # Blueprint
 model_bp = Blueprint('model', __name__)
@@ -133,7 +153,7 @@ def segment_and_detect(image_path):
     }
 
 
-def modify_3d_model(base_model_path, colors, scale_factor=1.0):
+def modify_3d_model(base_model_data, colors, scale_factor=1.0):
     """
     Modifica modelo 3D base aplicando colores y escala
 
@@ -174,6 +194,56 @@ def modify_3d_model(base_model_path, colors, scale_factor=1.0):
     return output
 
 
+def download_model_from_s3(object_key):
+    """Descarga modelo 3D desde S3 a memoria"""
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=object_key)
+        model_data = BytesIO(response['Body'].read())
+        model_data.seek(0)
+        return model_data
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return None
+        raise
+
+
+def upload_model_to_s3(file_data, object_key):
+    """Sube modelo 3D modificado a S3"""
+    try:
+        file_data.seek(0)
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=object_key,
+            Body=file_data.getvalue(),
+            ContentType='model/gltf-binary'
+        )
+        url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{object_key}"
+        return url
+    except ClientError as e:
+        raise Exception(f"Error subiendo a S3: {str(e)}")
+
+
+def list_available_models_in_s3():
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=S3_BUCKET_NAME,
+            Prefix=S3_MODELS_PREFIX
+        )
+        if 'Contents' not in response:
+            return []
+
+        models = []
+        for obj in response['Contents']:
+            key = obj['Key']
+            if key.endswith('.glb'):
+                model_name = key.replace(S3_MODELS_PREFIX, '').replace('.glb', '')
+                models.append(model_name)
+        return models
+    except ClientError as e:
+        print(f"Error listando modelos: {str(e)}")
+        return []
+
+
 @model_bp.route('/process-image', methods=['POST'])
 def process_image():
     """
@@ -209,45 +279,45 @@ def process_image():
             os.remove(filepath)
             return jsonify({"message": "No se detectó ningún objeto en la imagen"}), 404
 
-        # Mapear objeto detectado a modelo 3D base
-        # Ejemplo: si detecta "dog" busca "dog.glb"
+        # Mapear objeto detectado a modelo 3D en S3
         detected_object = detection_data["object"]
-        base_model_filename = f"{detected_object}.glb"
-        base_model_path = os.path.join(MODELS_FOLDER, base_model_filename)
+        s3_model_key = f"{S3_MODELS_PREFIX}{detected_object}.glb"
 
-        # Si no existe el modelo específico, usar uno genérico
-        if not os.path.exists(base_model_path):
-            base_model_path = os.path.join(MODELS_FOLDER, "default.glb")
+        # Descargar modelo base desde S3
+        base_model_data = download_model_from_s3(s3_model_key)
 
-            if not os.path.exists(base_model_path):
+        # Si no existe, intentar con default
+        if not base_model_data:
+            s3_model_key = f"{S3_MODELS_PREFIX}default.glb"
+            base_model_data = download_model_from_s3(s3_model_key)
+
+            if not base_model_data:
                 os.remove(filepath)
                 return jsonify({
-                    "message": f"No se encontró modelo 3D para '{detected_object}'",
-                    "detection": detection_data
+                    "message": f"No se encontró modelo 3D para '{detected_object}' en S3",
+                    "detection": detection_data,
+                    "available_models": list_available_models_in_s3()
                 }), 404
 
         # Modificar modelo 3D con colores detectados
         colors = detection_data["colors"]
-        modified_model = modify_3d_model(base_model_path, colors)
+        modified_model = modify_3d_model(base_model_data, colors)
 
-        # Guardar modelo modificado temporalmente
+        # Subir modelo modificado a S3
         output_filename = f"{timestamp}_{detected_object}.glb"
-        output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+        s3_output_key = f"{S3_GENERATED_PREFIX}{output_filename}"
 
-        with open(output_path, 'wb') as f:
-            f.write(modified_model.getvalue())
+        model_url = upload_model_to_s3(modified_model, s3_output_key)
 
         # Limpiar imagen original
         os.remove(filepath)
-
-        # Construir URL del modelo (ajustar según tu servidor)
-        model_url = f"/api/model/download/{output_filename}"
 
         return jsonify({
             "success": True,
             "message": "Imagen procesada exitosamente",
             "detection": detection_data,
             "model_url": model_url,
+            "model_key": s3_output_key,
             "model_filename": output_filename
         }), 200
 
@@ -258,6 +328,23 @@ def process_image():
 
         return jsonify({
             "message": "Error al procesar la imagen",
+            "error": str(e)
+        }), 500
+
+
+@model_bp.route('/available-models', methods=['GET'])
+def get_available_models():
+    """Endpoint para listar modelos base disponibles en S3"""
+    try:
+        models = list_available_models_in_s3()
+        return jsonify({
+            "success": True,
+            "models": models,
+            "count": len(models)
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "message": "Error al listar modelos",
             "error": str(e)
         }), 500
 
@@ -282,9 +369,3 @@ def download_model(filename):
 
     except Exception as e:
         return jsonify({"message": "Error al descargar archivo", "error": str(e)}), 500
-
-"""
-Codigo para integración con AWS:
-
-
-"""
