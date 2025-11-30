@@ -13,7 +13,10 @@ import boto3
 import cv2
 import numpy as np
 import trimesh
+from botocore.config import Config
 from botocore.exceptions import ClientError
+from botocore.exceptions import ReadTimeoutError
+from bson import ObjectId
 from dotenv import load_dotenv
 from flask import Blueprint, request, jsonify
 from flask import send_file
@@ -43,12 +46,22 @@ S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 S3_MODELS_PREFIX = '3d_models/'
 S3_GENERATED_PREFIX = 'generated_models/'
 
+s3_config = Config(
+    connect_timeout=30,
+    read_timeout=120,
+    retries={
+        'max_attempts': 3,
+        'mode': 'adaptive'
+    }
+)
+
 # Cliente S3
 s3_client = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION
+    region_name=AWS_REGION,
+    config=s3_config
 )
 
 TRIMESH_EXECUTOR_MAX_WORKERS = 2
@@ -793,7 +806,7 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def process_image_background(filepath, unique_filename):
+def process_image_background(filepath, unique_filename, user_id=None):
     """Procesa imagen con protección contra processing infinito"""
     task_id = unique_filename
 
@@ -802,8 +815,8 @@ def process_image_background(filepath, unique_filename):
         task_manager.cleanup_expired()
 
         logger.info(f"[{task_id}] ======== INICIO ========")
+        logger.info(f"[{task_id}] User ID: {user_id}")
         logger.info(f"[{task_id}] Ruta archivo: {filepath}")
-        logger.info(f"[{task_id}] Archivo existe: {os.path.exists(filepath)}")
 
         # ==================== DETECCIÓN ====================
         if task_manager.should_cancel(task_id):
@@ -940,6 +953,23 @@ def process_image_background(filepath, unique_filename):
                 os.remove(filepath)
             return
 
+        logger.info(f"[{task_id}] Guardando en base de datos...")
+        task_manager.update_status(task_id, "saving_db", 95, "Guardando en BD...")
+
+        try:
+            model_db_id = save_generated_model_to_db(
+                task_id=task_id,
+                detection_data=detection_data,
+                model_url=model_url,
+                model_key=s3_output_key,
+                model_filename=output_filename,
+                user_id=user_id  # ⭐ Pasar user_id
+            )
+            logger.info(f"[{task_id}] Modelo guardado en BD con ID: {model_db_id}")
+        except Exception as e:
+            logger.error(f"[{task_id}] Error guardando en BD (no crítico): {str(e)}")
+            model_db_id = None  # No fallar todo el proceso si falla el guardado en BD
+
         # COMPLETADO
         if os.path.exists(filepath):
             os.remove(filepath)
@@ -957,22 +987,9 @@ def process_image_background(filepath, unique_filename):
             model_url=model_url,
             model_key=s3_output_key,
             model_filename=output_filename,
+            model_db_id=model_db_id,
             timings=timings
         )
-
-        if state == "completed":
-            response.update({
-                "success": True,
-                "detection": status.get("detection"),
-                "modelUrl": status.get("model_url"),
-                "model_url": status.get("model_url"),
-                "modelKey": status.get("model_key"),
-                "model_key": status.get("model_key"),
-                "modelFilename": status.get("model_filename"),
-                "model_filename": status.get("model_filename"),
-                "modelDbId": status.get("model_db_id"),  # ← Agregar ID de BD
-                "model_db_id": status.get("model_db_id")
-            })
 
         logger.info(f"[{task_id}] COMPLETADO ({total_time:.2f}s)")
         logger.info(f"[{task_id}] FIN")
@@ -988,7 +1005,6 @@ def process_image_background(filepath, unique_filename):
         task_manager.update_status(task_id, "failed", 0, f"Error crítico: {str(e)[:100]}")
         if os.path.exists(filepath):
             os.remove(filepath)
-        logger.info(f"[{task_id}]")
 
 
 TASK_STATES = {
@@ -1005,68 +1021,16 @@ TASK_STATES = {
 }
 
 
-def save_generated_model_to_db(task_id, detection_data, model_url, model_key, model_filename, user_id=None):
-    """
-    Guarda el modelo generado en MongoDB
-
-    Args:
-        task_id: ID de la tarea
-        detection_data: Datos de detección (objeto detectado, confianza, colores, etc.)
-        model_url: URL del modelo en S3
-        model_key: Clave del modelo en S3
-        model_filename: Nombre del archivo del modelo
-        user_id: ID del usuario que generó el modelo (opcional)
-
-    Returns:
-        ObjectId del documento insertado o None sí falla
-    """
-    try:
-        models_collection = mongo.db.models
-
-        # Preparar datos del modelo
-        model_data = {
-            "name": f"{detection_data.get('object', 'model')} - Generated",
-            "description": f"Modelo generado automáticamente detectando: {detection_data.get('object', 'unknown')} con "
-                           f"confianza {detection_data.get('confidence', 0):.2%}",
-            "category": detection_data.get('object', 'unknown').lower(),
-            "imageUrl": "",
-            "modelUrl": model_url,
-            "modelKey": model_key,
-            "modelFilename": model_filename,
-            "rating": 0.0,
-            "price": 0.0,
-            "isActive": True,
-            "userId": user_id,
-            "detectionData": {
-                "object": detection_data.get('object'),
-                "confidence": detection_data.get('confidence'),
-                "bbox": detection_data.get('bbox'),
-                "colors": detection_data.get('colors')
-            },
-            "taskId": task_id,
-            "createdAt": datetime.now().isoformat(),
-            "updatedAt": datetime.now().isoformat(),
-            "status": "completed"
-        }
-
-        result = models_collection.insert_one(model_data)
-        logger.info(f"[{task_id}] Modelo guardado en BD con ID: {result.inserted_id}")
-        return str(result.inserted_id)
-
-    except Exception as e:
-        logger.error(f"[{task_id}] Error guardando modelo en BD: {str(e)}\n{traceback.format_exc()}")
-        return None
-
-
 @model_bp.route('/process-image', methods=['POST'])
 def process_image():
-    """
-    Endpoint para procesar imagen y generar modelo 3D (Asincrónico)
-    """
+    """Endpoint para procesar imagen y generar modelo 3D (Asincrónico)"""
     if 'image' not in request.files:
         return jsonify({"message": "No se envió ninguna imagen"}), 400
 
     file = request.files['image']
+
+    user_id = request.form.get('user_id', None)
+    logger.info(f"Recibiendo imagen con user_id: {user_id}")
 
     if file.filename == '':
         return jsonify({"message": "Nombre de archivo vacío"}), 400
@@ -1085,11 +1049,11 @@ def process_image():
         processing_status[unique_filename] = {
             "status": "processing",
             "progress": 0,
-            "current_step": "Guardando imagen..."
+            "current_step": "Guardando imagen...",
+            "user_id": user_id
         }
 
-        # Iniciar procesamiento en background
-        thread = Thread(target=process_image_background, args=(filepath, unique_filename))
+        thread = Thread(target=process_image_background, args=(filepath, unique_filename, user_id))
         thread.daemon = True
         thread.start()
 
@@ -1159,11 +1123,19 @@ def get_processing_status(task_id):
 
     if public_state == "completed":
         response.update({
+            "success": True,
             "detection": status.get("detection"),
             "modelUrl": status.get("model_url"),
+            "model_url": status.get("model_url"),
             "modelKey": status.get("model_key"),
+            "model_key": status.get("model_key"),
             "modelFilename": status.get("model_filename"),
+            "model_filename": status.get("model_filename"),
+            "modelDbId": status.get("model_db_id"),
+            "model_db_id": status.get("model_db_id"),
+            "timings": status.get("timings")
         })
+        return jsonify(response), 200
 
     elif public_state == "error":
         response.update({
@@ -1171,6 +1143,59 @@ def get_processing_status(task_id):
         })
 
     return jsonify(response), 200
+
+
+def save_generated_model_to_db(task_id, detection_data, model_url, model_key, model_filename, user_id=None):
+    """
+    Guarda el modelo generado en MongoDB
+
+    Args:
+        task_id: ID de la tarea
+        detection_data: Datos de detección (objeto detectado, confianza, colores, etc.)
+        model_url: URL del modelo en S3
+        model_key: Clave del modelo en S3
+        model_filename: Nombre del archivo del modelo
+        user_id: ID del usuario que generó el modelo (opcional)
+
+    Returns:
+        String con ObjectId del documento insertado o None si falla
+    """
+    try:
+        models_collection = mongo.db.models
+
+        # Preparar datos del modelo
+        model_data = {
+            "name": f"{detection_data.get('object', 'model').title()} - Generado",
+            "description": f"Modelo generado automáticamente detectando: {detection_data.get('object', 'unknown')} "
+                           f"con confianza {detection_data.get('confidence', 0):.2%}",
+            "category": detection_data.get('object', 'unknown').lower(),
+            "imageUrl": "",  # TODO: Generar thumbnail del modelo
+            "modelUrl": model_url,
+            "modelKey": model_key,
+            "modelFilename": model_filename,
+            "rating": 0.0,
+            "price": 0.0,
+            "isActive": False,
+            "userId": ObjectId(user_id) if user_id else None,
+            "detectionData": {
+                "object": detection_data.get('object'),
+                "confidence": detection_data.get('confidence'),
+                "bbox": detection_data.get('bbox'),
+                "colors": detection_data.get('colors')
+            },
+            "taskId": task_id,
+            "createdAt": datetime.utcnow(),
+            "updatedAt": datetime.utcnow(),
+            "status": "completed"
+        }
+
+        result = models_collection.insert_one(model_data)
+        logger.info(f"[{task_id}] Modelo guardado en BD con ID: {result.inserted_id}")
+        return str(result.inserted_id)
+
+    except Exception as e:
+        logger.error(f"[{task_id}] Error guardando modelo en BD: {str(e)}\n{traceback.format_exc()}")
+        return None
 
 
 def modify_3d_model(base_model_data, colors, scale_factor=1.0, task_id=None):
@@ -1233,19 +1258,46 @@ def modify_3d_model(base_model_data, colors, scale_factor=1.0, task_id=None):
 
 
 def download_model_from_s3(object_key, task_id=None):
-    """Descarga modelo 3D desde S3"""
+    """Descarga modelo 3D desde S3 con reintentos"""
     logger.info(f"[{task_id}] Intentando descargar: {object_key}")
-    try:
-        response = s3_client.get_object(
-            Bucket=S3_BUCKET_NAME,
-            Key=object_key
-        )
-        logger.info(f"[{task_id}] Descarga completada")
-        model_data = response['Body'].read()
-        return BytesIO(model_data)
-    except ClientError as e:
-        logger.error(f"[{task_id}] Error S3: {e}")
-        return None
+
+    max_retries = 3
+    retry_delay = 2  # segundos
+
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"[{task_id}] Intento {attempt + 1}/{max_retries}")
+
+            response = s3_client.get_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=object_key
+            )
+
+            logger.info(f"[{task_id}] Descarga completada")
+
+            # Leer con chunks para evitar timeouts
+            model_data = BytesIO()
+            chunk_size = 1024 * 1024  # 1MB chunks
+
+            for chunk in response['Body'].iter_chunks(chunk_size=chunk_size):
+                model_data.write(chunk)
+
+            model_data.seek(0)
+            return model_data
+
+        except (ClientError, ReadTimeoutError) as e:
+            logger.warning(f"[{task_id}] Error en intento {attempt + 1}: {str(e)}")
+
+            if attempt < max_retries - 1:
+                import time
+                logger.info(f"[{task_id}] Reintentando en {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Backoff exponencial
+            else:
+                logger.error(f"[{task_id}] Agotados todos los reintentos")
+                return None
+
+    return None
 
 
 def upload_model_to_s3(file_data, object_key, task_id=None):
@@ -1402,4 +1454,59 @@ def get_catalog():
         return jsonify({
             "message": "Error al obtener catálogo",
             "error": str(e)
+        }), 500
+
+
+@model_bp.route('/user/<user_id>/models', methods=['GET'])
+def get_user_models(user_id):
+    """Obtiene todos los modelos generados por un usuario"""
+    try:
+        from bson import ObjectId
+        from datetime import datetime
+
+        models_collection = mongo.db.models
+
+        user_models = models_collection.find({
+            'userId': ObjectId(user_id)
+        }).sort('createdAt', -1)
+
+        models_list = []
+        for model in user_models:
+            # ⭐ Convertir datetime a string
+            created_at = model.get('createdAt')
+            if isinstance(created_at, datetime):
+                created_at = created_at.isoformat()
+            elif isinstance(created_at, str):
+                created_at = created_at
+            else:
+                created_at = None
+
+            models_list.append({
+                '_id': str(model['_id']),
+                'name': model.get('name', ''),
+                'description': model.get('description', ''),
+                'category': model.get('category', ''),
+                'imageUrl': model.get('imageUrl', ''),
+                'modelUrl': model.get('modelUrl', ''),
+                'modelKey': model.get('modelKey', ''),
+                'modelFilename': model.get('modelFilename', ''),
+                'price': model.get('price', 0.0),
+                'rating': model.get('rating', 0.0),
+                'isActive': model.get('isActive', False),
+                'detectionData': model.get('detectionData', {}),
+                'createdAt': created_at,  # ⭐ Ya es string
+                'status': model.get('status', 'unknown')
+            })
+
+        return jsonify({
+            'success': True,
+            'models': models_list,
+            'count': len(models_list)
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error obteniendo modelos del usuario: {str(e)}")
+        return jsonify({
+            'error': 'Error al obtener modelos',
+            'details': str(e)
         }), 500
