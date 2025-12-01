@@ -1175,7 +1175,7 @@ def save_generated_model_to_db(task_id, detection_data, model_url, model_key, mo
             "modelFilename": model_filename,
             "rating": 0.0,
             "price": 0.0,
-            "isActive": False,
+            "isActive": True,
             "userId": ObjectId(user_id) if user_id else None,
             "detectionData": {
                 "object": detection_data.get('object'),
@@ -1492,7 +1492,7 @@ def get_user_models(user_id):
                 'modelFilename': model.get('modelFilename', ''),
                 'price': model.get('price', 0.0),
                 'rating': model.get('rating', 0.0),
-                'isActive': model.get('isActive', False),
+                'isActive': model.get('isActive', True),
                 'detectionData': model.get('detectionData', {}),
                 'createdAt': created_at,  # ⭐ Ya es string
                 'status': model.get('status', 'unknown')

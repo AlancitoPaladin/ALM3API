@@ -2,6 +2,7 @@ import json
 import random
 import string
 
+from bson import ObjectId
 from flask import Blueprint, request, jsonify
 from pydantic import ValidationError
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -122,35 +123,29 @@ def notifications():
     return None
 
 
-@auth_bp.route('/models', methods=['GET'])
-def get_models():
+@auth_bp.route('/api/model/<model_id>', methods=['GET'])
+def get_model_by_id(model_id):
     try:
-        # Obtener parámetros opcionales
-        category = request.args.get('category', None)
+        models_collection = mongo.db.models
 
-        models_collection = mongo.db.models  # Ajusta el nombre de la colección
+        model = models_collection.find_one({
+            "_id": ObjectId(model_id),
+            "isActive": True
+        })
 
-        # Construir query
-        query = {"isActive": True}
-        if category:
-            query["category"] = category
+        if not model:
+            return jsonify({"error": "Modelo no encontrado"}), 404
 
-        # Obtener modelos de la base de datos
-        models_cursor = models_collection.find(query)
-        models_list = list(models_cursor)
+        model["_id"] = str(model["_id"])
+        model.setdefault("rating", 0.0)
+        model.setdefault("price", 0.0)
 
-        # Convertir ObjectId a string
-        for model in models_list:
-            model['_id'] = str(model['_id'])
-            # Asegurar que tenga los campos requeridos
-            model.setdefault('rating', 0.0)
-            model.setdefault('price', 0.0)
-            model.setdefault('isActive', True)
+        return jsonify({"model": model}), 200
 
-        return JSONEncoder().encode({"models": models_list}), 200
-
+    except InvalidId:
+        return jsonify({"error": "ID inválido"}), 400
     except Exception as e:
-        return jsonify({"error": "Error al obtener modelos", "details": str(e)}), 500
+        return jsonify({"error": "Error al obtener modelo", "details": str(e)}), 500
 
 
 @auth_bp.route('/models', methods=['POST'])
