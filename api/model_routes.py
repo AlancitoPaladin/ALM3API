@@ -27,6 +27,7 @@ from trimesh.util import concatenate
 from ultralytics import YOLO
 from werkzeug.utils import secure_filename
 
+
 from database.database_config import mongo
 
 model_bp = Blueprint("model_bp", __name__)
