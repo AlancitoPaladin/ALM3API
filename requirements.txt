@@ -78,8 +78,8 @@ six==1.17.0
 sympy==1.14.0
 termcolor==2.5.0
 threadpoolctl==3.6.0
-torch==2.5.0
-torchvision==0.20.0
+torch>=2.5.0
+torchvision>=0.20.0
 trimesh==4.9.0
 types-awscrt==0.28.4
 types-s3transfer==0.14.0
