@@ -29,7 +29,7 @@ from database.database_config import mongo
 
 model_bp = Blueprint("model_bp", __name__)
 
-# Configurar logging robusto con mejor formato
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-8s | [%(threadName)-12s] | %(name)s | %(message)s',
@@ -404,7 +404,7 @@ def timed_stage(stage_name, task_id, expected_duration_s=None):
             "expected_seconds": expected_duration_s
         })
 
-        status_msg = f"[{task_id}] ✓ {stage_name}: {elapsed:.3f}s"
+        status_msg = f"[{task_id}] {stage_name}: {elapsed:.3f}s"
         if expected_duration_s and elapsed > expected_duration_s * 1.5:
             status_msg += f" (esperado: ~{expected_duration_s}s)"
         logger.debug(status_msg)
@@ -434,7 +434,7 @@ def load_mesh_non_blocking(data, file_type='glb', task_id=None):
 
             # Ya es Mesh, validar
             if isinstance(loaded, trimesh.Trimesh):
-                logger.info(f"[{task_id}] ✓ Mesh cargado directamente en {elapsed:.3f}s")
+                logger.info(f"[{task_id}] Mesh cargado directamente en {elapsed:.3f}s")
                 mesh = loaded
 
             else:
@@ -466,7 +466,7 @@ def load_mesh_non_blocking(data, file_type='glb', task_id=None):
 
         except Exception as e:
             elapsed = time.time() - start
-            logger.error(f"[{task_id}] ❌ Error cargando mesh ({elapsed:.3f}s): {str(e)}")
+            logger.error(f"[{task_id}] Error cargando mesh ({elapsed:.3f}s): {str(e)}")
             return None, None
 
     # Ejecutar en thread pool con timeout
@@ -476,7 +476,7 @@ def load_mesh_non_blocking(data, file_type='glb', task_id=None):
         return mesh, info
 
     except FuturesTimeoutError:
-        logger.error(f"[{task_id}] ⏱️ TIMEOUT cargando mesh ({TRIMESH_LOAD_TIMEOUT}s)")
+        logger.error(f"[{task_id}] TIMEOUT cargando mesh ({TRIMESH_LOAD_TIMEOUT}s)")
         return None, None
     except Exception as e:
         logger.error(f"[{task_id}] Error en executor: {str(e)}")
@@ -698,7 +698,7 @@ def extract_dominant_colors(image_input, n_colors=3, is_cropped=False, task_id=N
         for color, pct in zip(colors_hex, percentages)
     ]
 
-    logger.debug(f"[{task_id}] ✓ Colores extraídos: {len(result)} colores")
+    logger.debug(f"[{task_id}] Colores extraídos: {len(result)} colores")
 
     return result
 
@@ -716,7 +716,7 @@ def segment_and_detect(image_path, use_cache=True, task_id=None):
                 image_hash = compute_image_hash(image_path)
                 cached_result = detection_cache.get(image_hash)
                 if cached_result is not None:
-                    logger.info(f"[{task_id}] ✓ Detección en caché")
+                    logger.info(f"[{task_id}] Detección en caché")
                     return cached_result
             except Exception as e:
                 logger.warning(f"[{task_id}] No se pudo usar caché: {str(e)}")
@@ -1243,7 +1243,7 @@ def modify_3d_model(base_model_data, colors, scale_factor=1.0, task_id=None):
 
             # Aplicar color a todos los vértices
             mesh.visual.vertex_colors = np.tile(color_rgba, (len(mesh.vertices), 1))
-            logger.debug(f"[{task_id}] ✓ Color aplicado: {primary_color}")
+            logger.debug(f"[{task_id}] Color aplicado: {primary_color}")
         except Exception as e:
             logger.warning(f"[{task_id}] No se pudo aplicar color: {str(e)}")
 
