@@ -3,12 +3,12 @@ import multiprocessing
 import os
 
 # Configuración de workers
-workers = 1  # Solo 1 worker para evitar OOM en Render free tier
+workers = 3  # Solo 1 worker para evitar OOM en Render free tier
 worker_class = 'sync'
 worker_connections = 1000
 
 # CRÍTICO: Aumentar timeout para procesamiento de imágenes
-timeout = 300  # 5 minutos (era 30 segundos por defecto)
+timeout = 300
 graceful_timeout = 300
 keepalive = 5
 
@@ -27,4 +27,4 @@ bind = f"0.0.0.0:{os.getenv('PORT', '10000')}"
 # Preload app para ahorrar memoria
 preload_app = False  # False para evitar problemas con threads
 
-print(f"🚀 Gunicorn configurado: timeout={timeout}s, workers={workers}")
+print(f" Gunicorn configurado: timeout={timeout}s, workers={workers}")
