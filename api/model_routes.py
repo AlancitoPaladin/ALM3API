@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import tempfile
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -12,6 +13,7 @@ from threading import Thread, RLock, Event
 import boto3
 import cv2
 import numpy as np
+import torch
 import trimesh
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -28,6 +30,26 @@ from werkzeug.utils import secure_filename
 from database.database_config import mongo
 
 model_bp = Blueprint("model_bp", __name__)
+
+if os.getenv('RENDER'):  # Variable de entorno que Render pone automáticamente
+    torch.set_num_threads(2)  # Limitar threads
+    os.environ['OMP_NUM_THREADS'] = '2'
+    os.environ['MKL_NUM_THREADS'] = '2'
+    print("Configuración Render activada: threads limitados")
+
+# Directorio temporal compatible con Render
+UPLOAD_FOLDER = os.path.join(tempfile.gettempdir(), 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Configuración de límites
+MAX_FILE_SIZE_MB = 10  # Limitar tamaño de imagen
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp'}
+
+
+def allowed_file(filename):
+    return '.' in filename and \
+        filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 
 # Configurar logging robusto con mejor formato
 logging.basicConfig(
@@ -71,7 +93,11 @@ TASK_MAX_DURATION_MINUTES = 5
 TASK_EXPIRY_HOURS = 24
 MAX_TASK_HISTORY = 500
 
-UPLOAD_FOLDER = "./uploads"
+UPLOAD_FOLDER = os.path.join(tempfile.gettempdir(), 'uploads')
+
+# Crear directorio si no existe
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
 
 yolo_model = None
@@ -1024,28 +1050,60 @@ TASK_STATES = {
 @model_bp.route('/process-image', methods=['POST'])
 def process_image():
     """Endpoint para procesar imagen y generar modelo 3D (Asincrónico)"""
-    if 'image' not in request.files:
-        return jsonify({"message": "No se envió ninguna imagen"}), 400
-
-    file = request.files['image']
-
-    user_id = request.form.get('user_id', None)
-    logger.info(f"Recibiendo imagen con user_id: {user_id}")
-
-    if file.filename == '':
-        return jsonify({"message": "Nombre de archivo vacío"}), 400
-
-    if not allowed_file(file.filename):
-        return jsonify({"message": "Formato de imagen no permitido"}), 400
-
     try:
+        # Validar imagen
+        if 'image' not in request.files:
+            logger.error("No se recibió archivo de imagen")
+            return jsonify({"message": "No se envió ninguna imagen"}), 400
+
+        file = request.files['image']
+        user_id = request.form.get('user_id', None)
+        logger.info(f"Recibiendo imagen con user_id: {user_id}")
+
+        if file.filename == '':
+            logger.error("Nombre de archivo vacío")
+            return jsonify({"message": "Nombre de archivo vacío"}), 400
+
+        if not allowed_file(file.filename):
+            logger.error(f"Formato no permitido: {file.filename}")
+            return jsonify({"message": "Formato de imagen no permitido"}), 400
+
+        # ⭐ NUEVO: Validar tamaño ANTES de guardar
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)  # Regresar al inicio
+
+        file_size_mb = file_size / (1024 * 1024)
+        logger.info(f"Tamaño de imagen: {file_size_mb:.2f} MB")
+
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            logger.error(f"Imagen muy grande: {file_size_mb:.2f} MB")
+            return jsonify({
+                "message": f"Imagen muy grande. Máximo {MAX_FILE_SIZE_MB}MB",
+                "size_mb": round(file_size_mb, 2)
+            }), 413
+
+        # Generar nombre único y guardar
         filename = secure_filename(file.filename)
-        timestamp = str(int(np.random.random() * 1000000))
+        timestamp = str(int(time.time() * 1000))  # Mejor timestamp
         unique_filename = f"{timestamp}_{filename}"
+
+        # Asegurar que el directorio existe
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
         filepath = os.path.join(UPLOAD_FOLDER, unique_filename)
+
+        logger.info(f"Guardando imagen en: {filepath}")
         file.save(filepath)
 
-        # Marcar como procesando
+        # Verificar que se guardó correctamente
+        if not os.path.exists(filepath):
+            logger.error(f"Error: archivo no se guardó en {filepath}")
+            return jsonify({"message": "Error al guardar imagen"}), 500
+
+        saved_size = os.path.getsize(filepath)
+        logger.info(f"Imagen guardada exitosamente. Tamaño: {saved_size} bytes")
+
+        # Inicializar estado del procesamiento
         processing_status[unique_filename] = {
             "status": "processing",
             "progress": 0,
@@ -1053,6 +1111,7 @@ def process_image():
             "user_id": user_id
         }
 
+        # Iniciar procesamiento en background
         thread = Thread(target=process_image_background, args=(filepath, unique_filename, user_id))
         thread.daemon = True
         thread.start()
@@ -1065,11 +1124,33 @@ def process_image():
         }), 202
 
     except Exception as e:
+        logger.error(f"Error en process_image: {str(e)}", exc_info=True)
         return jsonify({
             "message": "Error al procesar la imagen",
             "error": str(e)
         }), 500
 
+
+def load_yolo_model():
+    """Cargar modelo YOLO optimizado para Render"""
+    try:
+        # Usar modelo más ligero en producción
+        model_name = 'yolov8n.pt' if os.getenv('RENDER') else 'yolov8s.pt'
+
+        logger.info(f"Cargando modelo YOLO: {model_name}")
+        model = YOLO(model_name)
+
+        # Configurar para bajo consumo de memoria
+        if os.getenv('RENDER'):
+            model.overrides['verbose'] = False
+            model.overrides['device'] = 'cpu'  # Forzar CPU
+
+        logger.info("Modelo YOLO cargado exitosamente")
+        return model
+
+    except Exception as e:
+        logger.error(f"Error cargando modelo YOLO: {e}")
+        raise
 
 @model_bp.route('/status/<task_id>', methods=['GET'])
 def get_processing_status(task_id):
@@ -1397,22 +1478,75 @@ def clear_caches():
 def download_model(filename):
     """
     Endpoint para descargar modelo 3D generado
+
+    IMPORTANTE: En Render, este endpoint puede fallar si el archivo
+    se eliminó o el worker se reinició. Considera usar S3 directamente.
     """
     try:
-        filepath = os.path.join(UPLOAD_FOLDER, secure_filename(filename))
+        # Sanitizar filename
+        safe_filename = secure_filename(filename)
+        filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
 
+        logger.info(f"Intentando descargar: {filepath}")
+
+        # Verificar existencia del archivo
         if not os.path.exists(filepath):
-            return jsonify({"message": "Archivo no encontrado"}), 404
+            logger.warning(f"Archivo no encontrado: {filepath}")
+            logger.info(
+                f"Archivos disponibles en {UPLOAD_FOLDER}: {os.listdir(UPLOAD_FOLDER) if os.path.exists(UPLOAD_FOLDER) else 'directorio no existe'}")
+
+            return jsonify({
+                "message": "Archivo no encontrado",
+                "detail": "El archivo puede haber sido eliminado o el servidor se reinició. Use la URL de S3 para descargas persistentes.",
+                "filename": safe_filename
+            }), 404
+
+        # Verificar que es un archivo válido
+        if not os.path.isfile(filepath):
+            logger.error(f"La ruta existe pero no es un archivo: {filepath}")
+            return jsonify({
+                "message": "Ruta inválida",
+                "filename": safe_filename
+            }), 400
+
+        logger.info(f"Enviando archivo: {filepath} ({os.path.getsize(filepath)} bytes)")
 
         return send_file(
             filepath,
             mimetype='model/gltf-binary',
             as_attachment=True,
-            download_name=filename
+            download_name=safe_filename
         )
 
     except Exception as e:
-        return jsonify({"message": "Error al descargar archivo", "error": str(e)}), 500
+        logger.error(f"Error al descargar archivo: {str(e)}", exc_info=True)
+        return jsonify({
+            "message": "Error al descargar archivo",
+            "error": str(e)
+        }), 500
+
+
+def cleanup_old_files(max_age_hours=2):
+    """
+    Limpia archivos temporales antiguos del UPLOAD_FOLDER
+    En Render, /tmp se limpia automáticamente, pero esto ayuda a liberar espacio
+    """
+    try:
+        if not os.path.exists(UPLOAD_FOLDER):
+            return
+
+        now = time.time()
+        cutoff = now - (max_age_hours * 3600)
+
+        for filename in os.listdir(UPLOAD_FOLDER):
+            filepath = os.path.join(UPLOAD_FOLDER, filename)
+            if os.path.isfile(filepath):
+                file_modified = os.path.getmtime(filepath)
+                if file_modified < cutoff:
+                    logger.info(f"Limpiando archivo antiguo: {filename}")
+                    os.remove(filepath)
+    except Exception as e:
+        logger.error(f"Error en cleanup_old_files: {e}")
 
 
 @model_bp.route('/catalog', methods=['GET'])

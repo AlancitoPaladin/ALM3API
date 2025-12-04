@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: your-api-name
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --config gunicorn.conf.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+      - key: YOLO_CONFIG_DIR
+        value: /tmp/Ultralytics
