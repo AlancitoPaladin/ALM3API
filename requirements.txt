@@ -78,7 +78,7 @@ six==1.17.0
 sympy==1.14.0
 termcolor==2.5.0
 threadpoolctl==3.6.0
-torch==2.1.0
+torch==2.5.0
 torchvision==0.16.0
 trimesh==4.9.0
 types-awscrt==0.28.4
